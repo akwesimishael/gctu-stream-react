@@ -5,7 +5,6 @@ import Peer, { Instance } from 'simple-peer';
 import { initSocket } from '@/lib/socket';
 
 export default function VideoStream({ roomId, isInitiator = false }: { roomId: string, isInitiator?: boolean }) {
-  const [stream, setStream] = useState<MediaStream | null>(null);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
@@ -14,72 +13,129 @@ export default function VideoStream({ roomId, isInitiator = false }: { roomId: s
   const peerRef = useRef<Instance | null>(null);
 
   useEffect(() => {
-    let currentStream: MediaStream | null = null;
+    // CRITICAL: This must be a closure variable, NOT a ref.
+    // useRef persists across Strict Mode remounts, so Mount #2 would
+    // overwrite the cleanup flag set by Mount #1's teardown, causing
+    // Mount #1's async getUserMedia to think it's still alive.
+    let cleanedUp = false;
+    let localStream: MediaStream | null = null;
     
-    // Get local video stream
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setError('Camera access is not supported in this browser. You must use HTTPS or localhost to access the camera.');
+      return;
+    }
+
+    const socket = initSocket();
+
+    // Remove any stale listeners from a previous mount
+    socket.off('user-connected');
+    socket.off('signal');
+    socket.off('user-disconnected');
+
     navigator.mediaDevices.getUserMedia({ video: true, audio: true })
       .then((mediaStream) => {
-        currentStream = mediaStream;
-        setStream(mediaStream);
+        // If this effect was cleaned up while awaiting camera, stop immediately
+        if (cleanedUp) {
+          mediaStream.getTracks().forEach(track => track.stop());
+          return;
+        }
+
+        localStream = mediaStream;
         if (myVideo.current) {
           myVideo.current.srcObject = mediaStream;
         }
 
-        const socket = initSocket();
-        socket.emit('join-room', roomId);
+        // --- Socket event handlers ---
 
-        // When another user connects to the room
-        socket.on('user-connected', (userId) => {
-          console.log('User connected:', userId);
-          // Only the user already in the room (initiator) creates the initial offer
+        socket.on('user-connected', (userId: string) => {
+          if (cleanedUp) return;
+          console.log('[WebRTC] Remote user joined, creating offer for:', userId);
+          
+          if (peerRef.current) {
+            peerRef.current.destroy();
+            peerRef.current = null;
+          }
+
           const peer = new Peer({
             initiator: true,
             trickle: false,
             stream: mediaStream,
           });
 
-          peer.on('signal', (data) => {
-            socket.emit('offer', { to: userId, signal: data });
+          peer.on('signal', (signalData) => {
+            if (cleanedUp) return;
+            console.log('[WebRTC] Sending offer to:', userId);
+            socket.emit('signal', { to: userId, signal: signalData });
           });
 
-          peer.on('stream', (userStream) => {
+          peer.on('stream', (remoteStream) => {
+            console.log('[WebRTC] Received remote stream!');
             if (userVideo.current) {
-              userVideo.current.srcObject = userStream;
+              userVideo.current.srcObject = remoteStream;
             }
+            if (!cleanedUp) setConnected(true);
           });
 
-          socket.on('answer', (data) => {
-            peer.signal(data.signal);
-            setConnected(true);
-          });
+          peer.on('connect', () => console.log('[WebRTC] Connected!'));
+          peer.on('error', (err) => console.error('[WebRTC] Error:', err.message));
+          peer.on('close', () => console.log('[WebRTC] Closed'));
 
           peerRef.current = peer;
         });
 
-        // When receiving an offer
-        socket.on('offer', (data) => {
-          const peer = new Peer({
-            initiator: false,
-            trickle: false,
-            stream: mediaStream,
-          });
+        socket.on('signal', (data: { from: string; signal: any }) => {
+          if (cleanedUp) return;
+          const type = data.signal?.type;
+          console.log('[WebRTC] Received signal:', type, 'from:', data.from);
 
-          peer.on('signal', (signalData) => {
-            socket.emit('answer', { to: data.from, signal: signalData });
-          });
-
-          peer.on('stream', (userStream) => {
-            if (userVideo.current) {
-              userVideo.current.srcObject = userStream;
+          if (type === 'offer') {
+            // We are the non-initiator: create a peer to answer
+            if (peerRef.current) {
+              peerRef.current.destroy();
+              peerRef.current = null;
             }
-          });
 
-          peer.signal(data.signal);
-          setConnected(true);
-          peerRef.current = peer;
+            const peer = new Peer({
+              initiator: false,
+              trickle: false,
+              stream: mediaStream,
+            });
+
+            peer.on('signal', (signalData) => {
+              if (cleanedUp) return;
+              console.log('[WebRTC] Sending answer to:', data.from);
+              socket.emit('signal', { to: data.from, signal: signalData });
+            });
+
+            peer.on('stream', (remoteStream) => {
+              console.log('[WebRTC] Received remote stream!');
+              if (userVideo.current) {
+                userVideo.current.srcObject = remoteStream;
+              }
+              if (!cleanedUp) setConnected(true);
+            });
+
+            peer.on('connect', () => console.log('[WebRTC] Connected!'));
+            peer.on('error', (err) => console.error('[WebRTC] Error:', err.message));
+            peer.on('close', () => console.log('[WebRTC] Closed'));
+
+            peerRef.current = peer;
+            peer.signal(data.signal);
+
+          } else if (type === 'answer') {
+            // We are the initiator: feed the answer into our existing peer
+            if (peerRef.current && !peerRef.current.destroyed) {
+              console.log('[WebRTC] Processing answer');
+              peerRef.current.signal(data.signal);
+            } else {
+              console.warn('[WebRTC] Got answer but no initiator peer exists');
+            }
+          }
         });
 
         socket.on('user-disconnected', () => {
+          if (cleanedUp) return;
+          console.log('[WebRTC] Remote user disconnected');
           setConnected(false);
           if (userVideo.current) {
             userVideo.current.srcObject = null;
@@ -90,25 +146,32 @@ export default function VideoStream({ roomId, isInitiator = false }: { roomId: s
           }
         });
 
+        // Join the room AFTER all listeners are ready
+        socket.emit('join-room', roomId);
       })
       .catch((err) => {
         console.error('Failed to get local stream', err);
-        setError('Could not access camera or microphone. Please ensure permissions are granted.');
+        if (!cleanedUp) {
+          setError('Could not access camera or microphone. Please ensure permissions are granted.');
+        }
       });
 
     return () => {
-      // Cleanup
-      if (currentStream) {
-        currentStream.getTracks().forEach(track => track.stop());
-      }
+      cleanedUp = true;
+      
+      socket.off('user-connected');
+      socket.off('signal');
+      socket.off('user-disconnected');
+      
       if (peerRef.current) {
         peerRef.current.destroy();
+        peerRef.current = null;
       }
-      const socket = initSocket();
-      socket.off('user-connected');
-      socket.off('offer');
-      socket.off('answer');
-      socket.off('user-disconnected');
+      
+      if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+        localStream = null;
+      }
     };
   }, [roomId]);
 
@@ -128,15 +191,14 @@ export default function VideoStream({ roomId, isInitiator = false }: { roomId: s
       </div>
 
       <div className="flex-1 bg-gray-900 rounded-2xl overflow-hidden relative shadow-xl aspect-video border-2 border-gray-800">
-        {connected ? (
-          <video 
-            playsInline 
-            ref={userVideo} 
-            autoPlay 
-            className="w-full h-full object-cover"
-          />
-        ) : (
-          <div className="w-full h-full flex items-center justify-center text-gray-500 flex-col">
+        <video 
+          playsInline 
+          ref={userVideo} 
+          autoPlay 
+          className={`w-full h-full object-cover ${connected ? 'block' : 'hidden'}`}
+        />
+        {!connected && (
+          <div className="w-full h-full flex items-center justify-center text-gray-500 flex-col absolute inset-0 z-10 bg-gray-900">
             <div className="w-12 h-12 mb-4 rounded-full border-4 border-gray-600 border-t-blue-500 animate-spin" />
             <p>Waiting for connection...</p>
           </div>
